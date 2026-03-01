@@ -45,9 +45,26 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     sessionIdGenerator: undefined,
   });
 
+  // Read and parse body manually so the stream isn't consumed before transport reads it
+  let parsedBody: unknown;
+  try {
+    const raw = await new Promise<string>((resolve, reject) => {
+      let data = "";
+      req.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+      req.on("end", () => resolve(data));
+      req.on("error", reject);
+    });
+    parsedBody = raw ? JSON.parse(raw) : undefined;
+  } catch {
+    res.statusCode = 400;
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ error: "Invalid JSON body" }));
+    return;
+  }
+
   try {
     await mcpServer.connect(transport);
-    await transport.handleRequest(req, res);
+    await transport.handleRequest(req, res, parsedBody);
   } finally {
     await mcpServer.close();
   }
