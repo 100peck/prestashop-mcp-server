@@ -725,9 +725,8 @@ async def handle_sse(request):
         )
 
 
-async def main():
-    """Run the PrestaShop MCP server."""
-    # Quick API test using the proper client
+async def _test_api_connection():
+    """Test API connection before starting server."""
     try:
         config = Config()
         async with PrestaShopClient(config) as client:
@@ -736,54 +735,71 @@ async def main():
             if 'error' not in result:
                 print("✅ API connection successful with extended functionality", file=sys.stderr)
                 print("🆕 New features: Module, Cache, Theme & Navigation Tree management", file=sys.stderr)
+                return True
             else:
                 print(f"❌ API test failed: {result.get('error')}", file=sys.stderr)
-                return
+                return False
     except Exception as e:
         print(f"❌ API test error: {e}", file=sys.stderr)
+        return False
+
+
+async def run_sse_server(port: int):
+    """Run server in SSE mode over HTTP."""
+    if not await _test_api_connection():
         return
 
-    # Check transport mode
+    print(f"🚀 Starting Enhanced PrestaShop MCP server in SSE mode on port {port}...", file=sys.stderr)
+    print("✅ Server ready with full CRUD operations + Navigation Tree management", file=sys.stderr)
+    print(f"📡 SSE endpoint: http://localhost:{port}/sse", file=sys.stderr)
+    print(f"💚 Health check: http://localhost:{port}/health", file=sys.stderr)
+
+    app = Starlette(
+        routes=[
+            Route("/health", health_check),
+            Route("/sse", handle_sse),
+        ]
+    )
+
+    import uvicorn
+    config = uvicorn.Config(app, host="0.0.0.0", port=port)
+    uv_server = uvicorn.Server(config)
+    await uv_server.serve()
+
+
+async def run_stdio_server():
+    """Run server in stdio mode for local use."""
+    if not await _test_api_connection():
+        return
+
+    print("🚀 Starting Enhanced PrestaShop MCP server in stdio mode...", file=sys.stderr)
+    print("✅ Server ready with full CRUD operations + Navigation Tree management", file=sys.stderr)
+
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(
+            read_stream,
+            write_stream,
+            InitializationOptions(
+                server_name="prestashop-mcp",
+                server_version="4.0.0",
+                capabilities=server.get_capabilities(
+                    notification_options=NotificationOptions(),
+                    experimental_capabilities={},
+                ),
+            ),
+        )
+
+
+def main():
+    """Synchronous entry point."""
     transport_mode = os.getenv("MCP_TRANSPORT", "stdio").lower()
 
     if transport_mode == "sse":
-        # SSE mode - run HTTP server
         port = int(os.getenv("PORT", "8000"))
-        print(f"🚀 Starting Enhanced PrestaShop MCP server in SSE mode on port {port}...", file=sys.stderr)
-        print("✅ Server ready with full CRUD operations + Navigation Tree management", file=sys.stderr)
-        print(f"📡 SSE endpoint: http://localhost:{port}/sse", file=sys.stderr)
-        print(f"💚 Health check: http://localhost:{port}/health", file=sys.stderr)
-
-        # Create Starlette app with routes
-        app = Starlette(
-            routes=[
-                Route("/health", health_check),
-                Route("/sse", handle_sse),
-            ]
-        )
-
-        # Run with uvicorn
-        import uvicorn
-        uvicorn.run(app, host="0.0.0.0", port=port)
+        asyncio.run(run_sse_server(port))
     else:
-        # stdio mode - default for local use
-        print("🚀 Starting Enhanced PrestaShop MCP server in stdio mode...", file=sys.stderr)
-        print("✅ Server ready with full CRUD operations + Navigation Tree management", file=sys.stderr)
-
-        async with stdio_server() as (read_stream, write_stream):
-            await server.run(
-                read_stream,
-                write_stream,
-                InitializationOptions(
-                    server_name="prestashop-mcp",
-                    server_version="4.0.0",
-                    capabilities=server.get_capabilities(
-                        notification_options=NotificationOptions(),
-                        experimental_capabilities={},
-                    ),
-                ),
-            )
+        asyncio.run(run_stdio_server())
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

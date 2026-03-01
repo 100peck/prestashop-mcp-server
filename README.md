@@ -1,3 +1,5 @@
+
+
 # PrestaShop MCP Server
 
 A professional Model Context Protocol (MCP) Server for complete management of PrestaShop e-commerce stores with **extended functionality**.
