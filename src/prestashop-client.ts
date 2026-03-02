@@ -1,4 +1,6 @@
 import { create } from "xmlbuilder2";
+import { readFileSync, existsSync } from "node:fs";
+import { extname } from "node:path";
 import type { Config } from "./config.js";
 
 export class PrestaShopAPIError extends Error {
@@ -28,6 +30,22 @@ export class PrestaShopClient {
 
   private multilingualField(value: string): Array<{ id: number; value: string }> {
     return LANGUAGES.map((lang) => ({ id: lang.id, value }));
+  }
+
+  // Fields returned by PrestaShop GET that must not be sent in POST/PUT
+  // associations — can cause module hooks (e.g. monster_balikobot) to crash with get_class(null)
+  private readonly PRODUCT_STRIP_FIELDS = [
+    "manufacturer_name", "quantity", "position_in_category",
+    "id_default_combination", "id_default_image",
+    "associations",
+  ];
+
+  private stripReadonlyFields(productData: JsonObject): JsonObject {
+    const cleaned = { ...productData };
+    for (const field of this.PRODUCT_STRIP_FIELDS) {
+      delete cleaned[field];
+    }
+    return cleaned;
   }
 
   private generateLinkRewrite(name: string): string {
@@ -135,11 +153,27 @@ export class PrestaShopClient {
     limit?: number;
     categoryId?: string;
     nameFilter?: string;
+    manufacturerId?: string;
+    manufacturerName?: string;
     includeDetails?: boolean;
     includeStock?: boolean;
     includeCategoryInfo?: boolean;
     display?: string;
   }): Promise<JsonObject> {
+    // Resolve manufacturer name → ID if needed
+    if (opts.manufacturerName && !opts.manufacturerId) {
+      const mfResp = await this.request("GET", "manufacturers", {
+        "filter[name]": opts.manufacturerName,
+        "display": "full",
+      });
+      const mfList = mfResp["manufacturers"];
+      if (Array.isArray(mfList) && mfList.length > 0) {
+        opts.manufacturerId = String((mfList[0] as JsonObject)["id"]);
+      } else {
+        return { products: [], count: 0, message: `Manufacturer '${opts.manufacturerName}' not found` };
+      }
+    }
+
     if (opts.productId) {
       return this.getSingleProduct(opts.productId, opts);
     }
@@ -203,6 +237,7 @@ export class PrestaShopClient {
     limit?: number;
     categoryId?: string;
     nameFilter?: string;
+    manufacturerId?: string;
     includeDetails?: boolean;
     includeStock?: boolean;
     includeCategoryInfo?: boolean;
@@ -212,6 +247,7 @@ export class PrestaShopClient {
     if (opts.display) params["display"] = opts.display;
     if (opts.nameFilter) params["filter[name]"] = `[${opts.nameFilter}]%`;
     if (opts.categoryId) params["filter[id_category_default]"] = opts.categoryId;
+    if (opts.manufacturerId) params["filter[id_manufacturer]"] = opts.manufacturerId;
 
     const productsData = await this.request("GET", "products", params);
 
@@ -323,7 +359,7 @@ export class PrestaShopClient {
     const existing = await this.request("GET", `products/${productId}`);
     if (!("product" in existing)) throw new PrestaShopAPIError(`Product ${productId} not found`);
 
-    const productData = { ...(existing["product"] as JsonObject) };
+    const productData = this.stripReadonlyFields(existing["product"] as JsonObject);
 
     if (updates.name !== undefined) {
       productData["name"] = this.multilingualField(updates.name);
@@ -334,11 +370,202 @@ export class PrestaShopClient {
     if (updates.categoryId !== undefined) productData["id_category_default"] = updates.categoryId;
     if (updates.active !== undefined) productData["active"] = updates.active ? "1" : "0";
 
-    return this.request("PUT", `products/${productId}`, undefined, { product: productData });
+    try {
+      return await this.request("PUT", `products/${productId}`, undefined, { product: productData });
+    } catch (err) {
+      // Some modules (e.g. monster_balikobot) emit PHP warnings that PrestaShop
+      // wraps in a 500 response even though the product was actually updated.
+      // If the error looks like a PHP warning (not a real PrestaShop error), verify
+      // the update succeeded by re-fetching the product.
+      if (err instanceof PrestaShopAPIError && /PHP Warning/i.test(err.message)) {
+        const verified = await this.request("GET", `products/${productId}`);
+        return { ...(verified["product"] as JsonObject), _warning: "Update succeeded despite module warning" };
+      }
+      throw err;
+    }
   }
 
   async deleteProduct(productId: string): Promise<JsonObject> {
     return this.request("DELETE", `products/${productId}`);
+  }
+
+  async duplicateProduct(opts: {
+    productId: string;
+    newName?: string;
+    imageUrls?: string[];
+    active?: boolean;
+  }): Promise<JsonObject> {
+    // 1. Get existing product
+    const existing = await this.request("GET", `products/${opts.productId}`);
+    if (!("product" in existing)) throw new PrestaShopAPIError(`Product ${opts.productId} not found`);
+
+    // 2. Get current stock
+    const stockResp = await this.request("GET", "stock_availables", {
+      "filter[id_product]": opts.productId,
+      "filter[id_product_attribute]": "0",
+    });
+    const stockItems = stockResp["stock_availables"];
+    const quantity = Array.isArray(stockItems) && stockItems.length > 0
+      ? Number((stockItems[0] as JsonObject)["quantity"] ?? 0)
+      : 0;
+
+    // 3. Prepare new product — strip readonly fields, associations and remove ID
+    // associations (carriers, combinations, images) can cause module hooks to crash
+    const orig = existing["product"] as JsonObject;
+    const originalName = this.getProductName(orig);
+    const newName = opts.newName ?? `${originalName} (kopie)`;
+
+    const productData = this.stripReadonlyFields(orig);
+    delete productData["id"];
+    delete productData["associations"];
+    productData["name"] = this.multilingualField(newName);
+    productData["link_rewrite"] = this.multilingualField(this.generateLinkRewrite(newName));
+    productData["active"] = (opts.active ?? false) ? "1" : "0";
+    productData["state"] = "1";
+
+    // 4. Create new product — if module hooks crash on full data, fall back to minimal fields
+    let createResult = await this.request("POST", "products", undefined, { product: productData }).catch(() => null);
+
+    if (!createResult || !("product" in createResult)) {
+      // Fallback: minimal product creation (avoids module hooks reading unexpected fields)
+      const minimalData: JsonObject = {
+        name: productData["name"],
+        link_rewrite: productData["link_rewrite"],
+        price: productData["price"] ?? "0",
+        active: productData["active"],
+        state: "1",
+        id_category_default: productData["id_category_default"] ?? "2",
+        visibility: productData["visibility"] ?? "both",
+        condition: productData["condition"] ?? "new",
+        minimal_quantity: "1",
+        is_virtual: "0",
+        cache_is_pack: "0",
+        low_stock_alert: "0",
+      };
+      if (productData["description"]) minimalData["description"] = productData["description"];
+      if (productData["description_short"]) minimalData["description_short"] = productData["description_short"];
+      if (productData["reference"]) minimalData["reference"] = productData["reference"];
+      if (productData["weight"]) minimalData["weight"] = productData["weight"];
+      if (productData["id_manufacturer"]) minimalData["id_manufacturer"] = productData["id_manufacturer"];
+      if (productData["id_tax_rules_group"]) minimalData["id_tax_rules_group"] = productData["id_tax_rules_group"];
+      if (productData["wholesale_price"]) minimalData["wholesale_price"] = productData["wholesale_price"];
+      if (productData["unity"]) minimalData["unity"] = productData["unity"];
+      if (productData["unit_price_ratio"]) minimalData["unit_price_ratio"] = productData["unit_price_ratio"];
+
+      createResult = await this.request("POST", "products", undefined, { product: minimalData });
+      if (!("product" in createResult)) {
+        return { error: "Failed to create duplicate product", detail: createResult };
+      }
+    }
+
+    const newProductId = String((createResult["product"] as JsonObject)["id"]);
+
+    // 5. Copy stock quantity
+    if (quantity > 0) {
+      try { await this.updateProductStock(newProductId, quantity); } catch { /* ignore */ }
+    }
+
+    // 6. Upload images from URLs
+    const imageResults: JsonArray = [];
+    for (const imageUrl of opts.imageUrls ?? []) {
+      try {
+        const imgResult = await this.uploadProductImage(newProductId, imageUrl);
+        imageResults.push(imgResult);
+      } catch (e) {
+        imageResults.push({ error: String(e), url: imageUrl });
+      }
+    }
+
+    return {
+      success: true,
+      original_product_id: opts.productId,
+      new_product_id: newProductId,
+      new_name: newName,
+      stock_copied: quantity,
+      images_uploaded: imageResults.length,
+      image_results: imageResults,
+      message: `Product duplicated. New product ID: ${newProductId}`,
+    };
+  }
+
+  async uploadProductImage(
+    productId: string,
+    imageUrl: string,
+    base64Data?: string,
+    mimeType?: string,
+    filePath?: string
+  ): Promise<JsonObject> {
+    let buffer: ArrayBuffer;
+    let contentType: string;
+    let filenameHint = `image`;
+
+    if (filePath) {
+      // Upload from local filesystem path
+      if (!existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
+      const nodeBuffer = readFileSync(filePath);
+      buffer = nodeBuffer.buffer.slice(nodeBuffer.byteOffset, nodeBuffer.byteOffset + nodeBuffer.byteLength) as ArrayBuffer;
+      const ext = extname(filePath).toLowerCase().replace(".", "");
+      const mimeMap: Record<string, string> = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp" };
+      contentType = mimeType ?? mimeMap[ext] ?? "image/jpeg";
+      filenameHint = filePath.split("/").pop() ?? `image.${ext || "jpg"}`;
+    } else if (base64Data) {
+      // Upload from base64 encoded data
+      contentType = mimeType ?? "image/jpeg";
+      const binaryStr = atob(base64Data.replace(/^data:[^;]+;base64,/, ""));
+      const bytes = new Uint8Array(binaryStr.length);
+      for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+      buffer = bytes.buffer;
+      filenameHint = "image";
+    } else {
+      // Fetch the source image from URL
+      const imgResponse = await fetch(imageUrl);
+      if (!imgResponse.ok) throw new Error(`Failed to fetch image from ${imageUrl}: ${imgResponse.status}`);
+      let ct = imgResponse.headers.get("content-type") ?? "image/jpeg";
+      if (!ct.startsWith("image/")) ct = "image/jpeg";
+      contentType = ct.split(";")[0].trim();
+      buffer = await imgResponse.arrayBuffer();
+      filenameHint = imageUrl.split("/").pop()?.split("?")[0] ?? "image";
+    }
+
+    const blob = new Blob([buffer], { type: contentType });
+
+    // Derive filename with correct extension
+    const ext = contentType === "image/png" ? "png" : contentType === "image/gif" ? "gif" : "jpg";
+    const rawFilename = filenameHint;
+    const filename = rawFilename.includes(".") ? rawFilename : `${rawFilename}.${ext}`;
+
+    const formData = new FormData();
+    formData.append("image", blob, filename);
+
+    // PrestaShop requires output_format=JSON even for image uploads
+    const url = `${this.baseUrl}images/products/${productId}?output_format=JSON`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: this.authHeader },
+      body: formData,
+    });
+
+    const text = await response.text();
+    console.error(`[uploadProductImage] status=${response.status} body=${text.slice(0, 300)}`);
+
+    if (response.status >= 400) {
+      throw new Error(`Image upload failed (${response.status}): ${text}`);
+    }
+
+    if (!text) return { uploaded: true, product_id: productId };
+    try {
+      return { uploaded: true, ...(JSON.parse(text) as JsonObject) };
+    } catch {
+      return { uploaded: true, raw: text };
+    }
+  }
+
+  private getProductName(product: JsonObject): string {
+    const name = product["name"];
+    if (Array.isArray(name) && name.length > 0) {
+      return String((name[0] as JsonObject)["value"] ?? "Product");
+    }
+    return String(name ?? "Product");
   }
 
   async updateProductStock(productId: string, quantity: number): Promise<JsonObject> {
@@ -369,8 +596,76 @@ export class PrestaShopClient {
   async updateProductPrice(productId: string, price: number, wholesalePrice?: number): Promise<JsonObject> {
     return this.updateProduct(productId, {
       price,
-      ...(wholesalePrice !== undefined ? {} : {}),
+      ...(wholesalePrice !== undefined ? { wholesalePrice } : {}),
     });
+  }
+
+  async updateOutOfStockLabel(opts: {
+    productId: string;
+    availableLater?: string;   // label shown when OOS + backorders allowed
+    availableNow?: string;     // label shown when in stock
+    outOfStock?: 0 | 1 | 2;   // 0=deny, 1=allow backorders, 2=use shop default
+    combinationId?: string;    // optional: target specific combination
+  }): Promise<JsonObject> {
+    const results: JsonObject = {};
+
+    // Update product multilingual labels (available_now / available_later)
+    if (opts.availableLater !== undefined || opts.availableNow !== undefined) {
+      const existing = await this.request("GET", `products/${opts.productId}`);
+      if (!("product" in existing)) throw new PrestaShopAPIError(`Product ${opts.productId} not found`);
+
+      const productData = this.stripReadonlyFields(existing["product"] as JsonObject);
+      if (opts.availableLater !== undefined)
+        productData["available_later"] = this.multilingualField(opts.availableLater);
+      if (opts.availableNow !== undefined)
+        productData["available_now"] = this.multilingualField(opts.availableNow);
+
+      results["product_label_update"] = await this.request(
+        "PUT", `products/${opts.productId}`, undefined, { product: productData }
+      );
+    }
+
+    // Update out_of_stock setting on stock_available
+    if (opts.outOfStock !== undefined) {
+      const stockResp = await this.request("GET", "stock_availables", {
+        "filter[id_product]": opts.productId,
+        ...(opts.combinationId
+          ? { "filter[id_product_attribute]": opts.combinationId }
+          : { "filter[id_product_attribute]": "0" }),
+      });
+      const items = stockResp["stock_availables"];
+      if (Array.isArray(items) && items.length > 0) {
+        const stock = items[0] as JsonObject;
+        const stockId = stock["id"];
+        results["stock_update"] = await this.request(
+          "PUT", `stock_availables/${stockId}`, undefined, {
+            stock_available: {
+              id: String(stockId),
+              id_product: opts.productId,
+              id_product_attribute: opts.combinationId ?? "0",
+              id_shop: "1",
+              id_shop_group: "0",
+              quantity: String(stock["quantity"] ?? 0),
+              depends_on_stock: "0",
+              out_of_stock: String(opts.outOfStock),
+            },
+          }
+        );
+      }
+    }
+
+    return {
+      success: true,
+      product_id: opts.productId,
+      updates: results,
+      message: "Out-of-stock label updated",
+    };
+  }
+
+  async getManufacturers(limit = 20, nameFilter?: string): Promise<JsonObject> {
+    const params: Record<string, string | number> = { limit, display: "full" };
+    if (nameFilter) params["filter[name]"] = `[${nameFilter}]%`;
+    return this.request("GET", "manufacturers", params);
   }
 
   // ============================================================================
@@ -955,6 +1250,109 @@ export class PrestaShopClient {
     const params: Record<string, string> = {};
     if (filterName) params["filter[name]"] = `[${filterName}]%`;
     return this.request("GET", "configurations", params);
+  }
+
+  async getUnsoldProducts(days = 90, limit = 10): Promise<JsonObject> {
+    const threshold = new Date();
+    threshold.setDate(threshold.getDate() - days);
+    const dateStr = threshold.toISOString().slice(0, 10);
+
+    // Step 1: Get recent orders — load with date_add field and filter in code
+    // (PrestaShop 1.7.x doesn't support filter[date_add] on orders)
+    const ordersResp = await this.request("GET", "orders", {
+      "display": "[id,date_add]",
+      "limit": "1000",
+    });
+
+    const soldIds = new Set<string>();
+    const allOrders = ordersResp["orders"];
+    // Filter to only orders newer than threshold
+    const orderList = Array.isArray(allOrders)
+      ? (allOrders as JsonObject[]).filter((o) => String(o["date_add"] ?? "").slice(0, 10) >= dateStr)
+      : [];
+
+    if (orderList.length > 0) {
+      // Step 2: For each order, get its order_details using filter[id_order]
+      // Process in batches of 10 parallel requests
+      const orderIds = (orderList as JsonObject[]).map((o) => String(o["id"]));
+      const batchSize = 10;
+      for (let i = 0; i < orderIds.length; i += batchSize) {
+        const batch = orderIds.slice(i, i + batchSize);
+        const results = await Promise.all(
+          batch.map((orderId) =>
+            this.request("GET", "order_details", {
+              "filter[id_order]": orderId,
+              "display": "[id_product]",
+              "limit": "100",
+            }).catch(() => ({}))
+          )
+        );
+        for (const result of results) {
+          const details = (result as JsonObject)["order_details"];
+          if (Array.isArray(details)) {
+            for (const d of details as JsonObject[]) {
+              if (d["id_product"]) soldIds.add(String(d["id_product"]));
+            }
+          }
+        }
+      }
+    }
+
+    // Step 3: Get all active products and filter out the sold ones
+    const productsResp = await this.request("GET", "products", {
+      "display": "[id,name,price,date_add,active]",
+      "filter[active]": "1",
+      "limit": "500",
+    });
+
+    const unsold: JsonArray = [];
+    const allProducts = productsResp["products"];
+    if (Array.isArray(allProducts)) {
+      for (const p of allProducts as JsonObject[]) {
+        if (!soldIds.has(String(p["id"]))) {
+          unsold.push(p);
+          if (unsold.length >= limit) break;
+        }
+      }
+    }
+
+    // Step 4: Enrich with stock quantity
+    const enriched: JsonArray = [];
+    for (const p of unsold as JsonObject[]) {
+      const pid = String(p["id"]);
+      const dateAdd = String(p["date_add"] ?? "").slice(0, 10);
+      const daysInShop = Math.floor((Date.now() - new Date(dateAdd).getTime()) / 86400000);
+
+      let stock = 0;
+      try {
+        const stockResp = await this.request("GET", "stock_availables", {
+          "filter[id_product]": pid,
+          "display": "[quantity]",
+        });
+        const items = stockResp["stock_availables"];
+        if (Array.isArray(items) && items.length > 0) {
+          stock = Number((items[0] as JsonObject)["quantity"] ?? 0);
+        }
+      } catch { /* skip */ }
+
+      enriched.push({
+        id: p["id"],
+        name: p["name"],
+        price: p["price"],
+        date_added: dateAdd,
+        days_in_shop: daysInShop,
+        stock_quantity: stock,
+      });
+    }
+
+    return {
+      unsold_products: enriched,
+      count: enriched.length,
+      threshold_date: dateStr,
+      recent_orders_checked: orderList.length,
+      sold_product_ids_count: soldIds.size,
+      message: `Found ${enriched.length} active products not sold in the last ${days} days`,
+    };
   }
 
   async getShopInfo(): Promise<JsonObject> {

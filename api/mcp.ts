@@ -65,6 +65,13 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
   try {
     await mcpServer.connect(transport);
     await transport.handleRequest(req, res, parsedBody);
+  } catch (err) {
+    console.error("[MCP ERROR]", err);
+    if (!res.headersSent) {
+      res.statusCode = 500;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ error: String(err) }));
+    }
   } finally {
     await mcpServer.close();
   }
