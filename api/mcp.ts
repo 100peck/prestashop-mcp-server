@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { loadConfig } from "../src/config.js";
 import { PrestaShopClient } from "../src/prestashop-client.js";
-import { registerAllTools } from "../src/tools/index.js";
+import { registerAllTools } from "../src/tools";
 
 function unauthorized(res: ServerResponse) {
   res.statusCode = 401;
